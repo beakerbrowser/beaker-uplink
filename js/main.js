@@ -1,18 +1,17 @@
-import { LitElement, html } from 'beaker://app-stdlib/vendor/lit-element/lit-element.js'
-import { repeat } from 'beaker://app-stdlib/vendor/lit-element/lit-html/directives/repeat.js'
-import { ViewThreadPopup } from 'beaker://app-stdlib/js/com/popups/view-thread.js'
-import { EditBookmarkPopup } from 'beaker://app-stdlib/js/com/popups/edit-bookmark.js'
-import * as toast from 'beaker://app-stdlib/js/com/toast.js'
-import { pluralize, getOrigin } from 'beaker://app-stdlib/js/strings.js'
-import { typeToQuery } from 'beaker://app-stdlib/js/records.js'
+import { LitElement, html } from '/vendor/beaker-app-stdlib/vendor/lit-element/lit-element.js'
+import { repeat } from '/vendor/beaker-app-stdlib/vendor/lit-element/lit-html/directives/repeat.js'
+import { ViewThreadPopup } from '/vendor/beaker-app-stdlib/js/com/popups/view-thread.js'
+import { EditBookmarkPopup } from '/vendor/beaker-app-stdlib/js/com/popups/edit-bookmark.js'
+import * as toast from '/vendor/beaker-app-stdlib/js/com/toast.js'
+import { getAvailableName } from '/vendor/beaker-app-stdlib/js/fs.js'
+import { pluralize, getOrigin, createResourceSlug } from '/vendor/beaker-app-stdlib/js/strings.js'
+import { typeToQuery } from '/vendor/beaker-app-stdlib/js/records.js'
 import * as QP from './lib/qp.js'
 import css from '../css/main.css.js'
-import './com/indexer-state.js'
-import 'beaker://app-stdlib/js/com/record-feed.js'
-import 'beaker://app-stdlib/js/com/sites-list.js'
-import 'beaker://app-stdlib/js/com/img-fallbacks.js'
+import '/vendor/beaker-app-stdlib/js/com/record-feed.js'
+import '/vendor/beaker-app-stdlib/js/com/sites-list.js'
+import '/vendor/beaker-app-stdlib/js/com/img-fallbacks.js'
 
-const INTRO_STEPS = {SUBSCRIBE: 0, GET_LISTED: 1}
 const PATH_QUERIES = {
   search: [typeToQuery('bookmark'), typeToQuery('blogpost')],
   all: [typeToQuery('bookmark'), typeToQuery('blogpost')]
@@ -21,12 +20,11 @@ const PATH_QUERIES = {
 class UplinkApp extends LitElement {
   static get properties () {
     return {
+      session: {type: Object},
       profile: {type: Object},
       suggestedSites: {type: Array},
       searchQuery: {type: String},
-      isEmpty: {type: Boolean},
-      listingSelfState: {type: String},
-      isProfileListedInBeakerNetwork: {type: Boolean}
+      isEmpty: {type: Boolean}
     }
   }
 
@@ -36,13 +34,12 @@ class UplinkApp extends LitElement {
 
   constructor () {
     super()
+    this.session = undefined
     this.profile = undefined
     this.origins = undefined
     this.suggestedSites = undefined
     this.searchQuery = ''
     this.isEmpty = false
-    this.listingSelfState = undefined
-    this.isProfileListedInBeakerNetwork = undefined
 
     this.configFromQP()
     this.load().then(() => {
@@ -71,22 +68,33 @@ class UplinkApp extends LitElement {
   }
 
   async load ({clearCurrent} = {clearCurrent: false}) {
-    this.profile = await beaker.browser.getProfile()
-    this.origins = [this.profile.url].concat((await beaker.subscriptions.list()).map(s => s.href))
+    if (!this.session) {
+      this.session = await beaker.session.get()
+    }
+    if (!this.session) {
+      return this.requestUpdate()
+    }
+    this.profile = this.session.user
+    let {mySubscriptions} = await beaker.index.gql(`
+      query Subs ($origin: String!) {
+        mySubscriptions: records(paths: ["/subscriptions/*.goto"] origins: [$origin]) {
+          metadata
+        }
+      }
+    `, {origin: this.profile.url})
+    var origins = new Set(mySubscriptions.map(sub => (getOrigin(sub.metadata.href))))
+    origins.add(getOrigin(this.profile.url))
+    this.origins = Array.from(origins)
     if (this.shadowRoot.querySelector('beaker-record-feed')) {
       this.shadowRoot.querySelector('beaker-record-feed').load({clearCurrent})
-    }
-    this.isProfileListedInBeakerNetwork = await beaker.browser.isProfileListedInBeakerNetwork()
-    if (this.isProfileListedInBeakerNetwork) {
-      this.listingSelfState = 'done'
-      this.setIntroStepCompleted(INTRO_STEPS.GET_LISTED, true)
     }
   }
 
   async loadSuggestions () {
+    if (!this.session) return
     const getSite = async (url) => {
       let {site} = await beaker.index.gql(`
-        query Site($url: String!) {
+        query Site ($url: String!) {
           site(url: $url) {
             url
             title
@@ -104,9 +112,7 @@ class UplinkApp extends LitElement {
         }
       }
     `)
-    var currentSubs = new Set((await beaker.subscriptions.list()).map(source => (getOrigin(source.href))))
-    currentSubs.add(getOrigin(this.profile.url))
-    var candidates = allSubscriptions.filter(sub => !currentSubs.has((getOrigin(sub.metadata.href))))
+    var candidates = allSubscriptions.filter(sub => !this.origins.includes((getOrigin(sub.metadata.href))))
     var suggestedSiteUrls = candidates.reduce((acc, candidate) => {
       var url = candidate.metadata.href
       if (!acc.includes(url)) acc.push(url)
@@ -119,7 +125,7 @@ class UplinkApp extends LitElement {
       let {moreSites} = await beaker.index.gql(`
         query { moreSites: sites(indexes: ["network"] limit: 12) { url } }
       `)
-      moreSites = moreSites.filter(site => !currentSubs.has(site.url))
+      moreSites = moreSites.filter(site => !this.origins.includes(site.url))
 
       // HACK
       // the network index for listSites() currently doesn't pull from index.json
@@ -138,31 +144,12 @@ class UplinkApp extends LitElement {
     return !!queryViewEls.find(el => el.isLoading)
   }
 
-  get isIntroActive () {
-    if (this._isIntroActive === false) {
-      return this._isIntroActive
-    }
-    var isActive = !this.isIntroStepCompleted(0) || !this.isIntroStepCompleted(1)
-    if (!isActive) this._isIntroActive = false // cache
-    return isActive
-  }
-
-  isIntroStepCompleted (step) {
-    return localStorage.getItem(`introStepCompleted:${step}`) == '1'
-  }
-
-  setIntroStepCompleted (step, v) {
-    this._isIntroActive = undefined
-    localStorage.setItem(`introStepCompleted:${step}`, v ? '1' : undefined)
-    this.requestUpdate()
-  }
-
   // rendering
   // =
 
   render () {
     return html`
-      <link rel="stylesheet" href="beaker://assets/font-awesome.css">
+      <link rel="stylesheet" href="/vendor/beaker-app-stdlib/css/fontawesome.css">
       <main>
         ${this.renderCurrentView()}
       </main>
@@ -213,6 +200,7 @@ class UplinkApp extends LitElement {
   }
 
   renderCurrentView () {
+    if (!this.session) return this.renderIntro()
     if (!this.origins) {
       return html``
     }
@@ -254,7 +242,6 @@ class UplinkApp extends LitElement {
                 </a>
               </h1>
             </div>
-            ${this.renderIntro()}
             ${this.isEmpty && !this.isIntroActive ? this.renderEmptyMessage() : ''}
             <beaker-record-feed
               show-date-titles
@@ -292,84 +279,17 @@ class UplinkApp extends LitElement {
   }
 
   renderIntro () {
-    if (!this.isIntroActive) {
-      return ''
-    }
     return html`
       <div class="intro">
         <div class="explainer">
+          <img src="/img/uplink">
           <h3>Welcome to Beaker Uplink!</h3>
           <p>See recent bookmarks and blogposts in your network.</p>
           <p>(You know. Like Reddit.)</p>
         </div>
-        <section>
-          <a class="icon">
-            <span class="${this.isIntroStepCompleted(0) ? 'fas fa-check-circle' : 'far fa-circle'}"></span>
-          </a>
-          <div>
-            <h4>
-              1. Subscribe to sites to see what's happening
-            </h4>
-            ${!this.suggestedSites ? html`<div><span class="spinner"></span></div>` : ''}
-            ${this.suggestedSites?.length > 0 ? html`
-              <div class="suggested-sites">
-                ${repeat(this.suggestedSites.slice(0, 6), site => html`
-                  <div class="site">
-                    <div class="title">
-                      <a href=${site.url} title=${site.title} target="_blank">${site.title}</a>
-                    </div>
-                    <div class="description">
-                      ${site.description}
-                    </div>
-                    ${site.subscribed ? html`
-                      <button class="transparent" disabled><span class="fas fa-check"></span> Subscribed</button>
-                    ` : html`
-                      <button @click=${e => this.onClickSuggestedSubscribe(e, site)}>Subscribe</button>
-                    `}
-                    <div class="subscribers">
-                      ${site.subCount} ${pluralize(site.subCount, 'subscriber')}
-                    </div>
-                  </div>
-                `)}
-              </div>
-              ` : ''}
-            <p>
-              <button
-                class="primary"
-                ?disabled=${this.isIntroStepCompleted(0)}
-                @click=${e => this.onClickCompleteIntroStep(e, 0)}
-              ><span class="fas fa-fw fa-check"></span> Done</button>
-            </p>
-          </div>
-        </section>
-        <section>
-          <a class="icon">
-            <span class="${this.isIntroStepCompleted(1) ? 'fas fa-check-circle' : 'far fa-circle'}"></span>
-          </a>
-          <div>
-            <h4>
-              2. Get listed
-              ${!this.isIntroStepCompleted(1) ? html`<a href="#" @click=${e => this.onClickCompleteIntroStep(e, 1)}><small>(skip)</small></a>` : ''}
-            </h4>
-            <p>Add your <a href=${this.profile?.url} target="_blank">personal site</a> to the Beaker Network so people can find you.</p>
-            <p>
-              ${this.listingSelfState === 'no' ? html`
-                <button class="primary" disabled>List my site</button>
-                <button class="transparent" @click=${this.onClickMaybeListMyself}>
-                  <span class="fas fa-fw fa-check"></span> No thanks, I don't want to be listed
-                </button>
-              ` : this.listingSelfState === 'attempting' ? html`
-                <button class="primary" disabled><span class="spinner"></span></button>
-                <button class="transparent" disabled>No thanks, I don't want to be listed</button>
-              ` : this.listingSelfState === 'done' ? html`
-                <button class="transparent" disabled><span class="fas fa-fw fa-check"></span> Site listed</button>
-              ` : html`
-                <button class="primary" @click=${this.onClickListMyself}>List my site</button>
-                <button class="transparent" @click=${this.onClickDontListMyself}>No thanks, I don't want to be listed</button>
-              `}
-            </p>
-          </div>
-        </section>
+        <div class="sign-in">
+          <button class="primary" @click=${this.onClickSignin}>Sign In</button> to get started
+        </div>
       </div>
     `
   }
@@ -423,37 +343,32 @@ class UplinkApp extends LitElement {
     e.preventDefault()
     site.subscribed = true
     this.requestUpdate()
-    await beaker.subscriptions.add({
+
+    var drive = beaker.hyperdrive.drive(this.profile.url)
+    var slug = createResourceSlug(site.url, site.title)
+    var filename = await getAvailableName('/subscriptions', slug, drive, 'goto') // avoid collisions
+    await drive.writeFile(`/subscriptions/${filename}`, '', {metadata: {
       href: site.url,
-      title: site.title,
-      site: this.profile.url
-    })
+      title: site.title
+    }})
     // wait 1s then replace/remove the suggestion
     setTimeout(() => {
       this.suggestedSites = this.suggestedSites.filter(s => s !== site)
     }, 1e3)
   }
 
-  onClickCompleteIntroStep (e, step) {
-    this.setIntroStepCompleted(step, true)
-  }
-
-  async onClickListMyself (e) {
-    this.listingSelfState = 'attempting'
-    await beaker.browser.addProfileToBeakerNetwork()
-    this.isProfileListedInBeakerNetwork = true
-    this.listingSelfState = 'done'
-    this.setIntroStepCompleted(INTRO_STEPS.GET_LISTED, true)
-  }
-
-  async onClickDontListMyself (e) {
-    this.listingSelfState = 'no'
-    this.setIntroStepCompleted(INTRO_STEPS.GET_LISTED, true)
-  }
-
-  async onClickMaybeListMyself (e) {
-    this.listingSelfState = undefined
-    this.setIntroStepCompleted(INTRO_STEPS.GET_LISTED, false)
+  async onClickSignin () {
+    await beaker.session.request({
+      permissions: {
+        publicFiles: [
+          {path: '/subscriptions/*.goto', access: 'write'},
+          {path: '/bookmarks/*.goto', access: 'write'},
+          {path: '/comments/*.md', access: 'write'},
+          {path: '/votes/*.goto', access: 'write'}
+        ]
+      }
+    })
+    location.reload()
   }
 }
 
